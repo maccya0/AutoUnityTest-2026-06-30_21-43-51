@@ -95,6 +95,9 @@ public class OllamaTestGeneratorWindow : EditorWindow
     // =================================================================
     // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
     // =================================================================
+    // =================================================================
+    // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
+    // =================================================================
     private void ExecutePhase1()
     {
         string gitDiff = GetGitDiff();
@@ -106,7 +109,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         string cleanDiffDescription = MaskGitDiff(gitDiff);
 
-        // ★ 境界値分析・複数条件網羅・異常系をAIへデフォルト義務化する強力なプロンプト
         StringBuilder sb = new StringBuilder();
         sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【変更内容】を深く解析し、高品質なテストケースの『仕様一覧』を日本語のMarkdownの表形式で出力してください。");
         sb.AppendLine();
@@ -116,9 +118,10 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine("3. 【異常系・エッジケース】: 0（ゼロ）、負の値、null、空文字、配列の境界外、想定外の不正な入力値によってプログラムがクラッシュしないか検証するエッジケースを最低1つ以上含めてください。");
         sb.AppendLine();
         sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| 1 | ...）だけを実直に出力してください。");
+        sb.AppendLine("⚠️最重要：テスト対象となる「正確なクラス名」と「正確なメソッド名」を【変更内容】から読み取り、必ず表の該当する列にそのまま記入してください。");
         sb.AppendLine();
-        sb.AppendLine("| 番号 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
-        sb.AppendLine("|---|---|---|---|---|");
+        sb.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
+        sb.AppendLine("|---|---|---|---|---|---|---|");
         sb.AppendLine();
         sb.AppendLine("【変更内容】");
         sb.AppendLine(cleanDiffDescription);
@@ -128,7 +131,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
             string finalResponse = response.Trim();
             if (!finalResponse.StartsWith("|"))
             {
-                finalResponse = "| 番号 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |\n|---|---|---|---|---|\n" + finalResponse;
+                finalResponse = "| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |\n|---|---|---|---|---|---|---|\n" + finalResponse;
             }
 
             string specPath = savePath.Replace(".cs", "_Spec.txt");
@@ -143,7 +146,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         StartSendPrompt(sb.ToString());
     }
-
     private string MaskGitDiff(string rawDiff)
     {
         StringBuilder sb = new StringBuilder();
@@ -185,10 +187,13 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         StringBuilder sb = new StringBuilder();
         sb.AppendLine("You are a Unity QA Engineer. Convert the following Japanese test specification table into a valid NUnit test class.");
-        sb.AppendLine("Please implement a dedicated [Test] method for EVERY single row defined in the specification table.");
-        sb.AppendLine("Rule 1: Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
-        sb.AppendLine("Rule 2: Do NOT re-define or implement the source classes (e.g. Calculator class) to avoid duplicate class errors.");
-        sb.AppendLine("Rule 3: Do NOT inherit MonoBehaviour.");
+        sb.AppendLine();
+        sb.AppendLine("## CRITICAL RULES FOR IMPLEMENTATION:");
+        sb.AppendLine("1. Implement a dedicated [Test] method for EVERY single row defined in the specification table.");
+        sb.AppendLine("2. ⚠️CRITICAL: You MUST use the exact class name from '対象クラス名' and the exact method name from '対象メソッド名' specified in the table columns. Do NOT invent or guess other method names.");
+        sb.AppendLine("3. Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
+        sb.AppendLine("4. Do NOT re-define or implement the source classes (e.g. Calculator class) to avoid duplicate class errors.");
+        sb.AppendLine("5. Do NOT inherit MonoBehaviour.");
         sb.AppendLine();
         sb.AppendLine("## Japanese Test Specification ##");
         sb.AppendLine(specContent);
@@ -208,7 +213,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         StartSendPrompt(sb.ToString());
     }
-
     // =================================================================
     // 共通サブシステム（Git取得、通信、トリミング）
     // =================================================================
