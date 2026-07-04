@@ -1,0 +1,10 @@
+﻿| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |
+|---|---|---|---|---|---|---|
+| 1 | Calculator | Add | 同値分割: 正数 | 5 | 10 | aとbを5ずつ加算し、期待値10と一致 |
+| 2 | Calculator | Add | 同値分割: 負数 | -5 | -10 | aとbを-5ずつ加算し、期待値-10と一致 |
+| 3 | Calculator | Add | 同値分割: 0 | 0 | 0 | aとbを0ずつ加算し、期待値0と一致 |
+| 4 | Calculator | Add | 同値分割: 最大値 | int.MaxValue | int.MaxValue | aとbをint.MaxValueずつ加算し、期待値int.MaxValueと一致 |
+| 5 | Calculator | Add | 同値分割: 最小値 | int.MinValue | int.MinValue | aとbをint.MinValueずつ加算し、期待値int.MinValueと一致 |
+| 6 | Calculator | Add | 異常系: 負の値 | -10 | -20 | aとbに負の値を指定し、期待値-20と一致 |
+| 7 | Calculator | Add | 異常系: 最大値+1 | int.MaxValue + 1 | 例外発生 | aとbにint.MaxValue+1を指定し、例外発生 |
+| 8 | Calculator | Add | 異常系: 最小値-1 | int.MinValue - 1 | 例外発生 | aとbにint.MinValue-1を指定し、例外発生 |

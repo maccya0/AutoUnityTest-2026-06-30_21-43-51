@@ -24,7 +24,6 @@ public class OllamaResponse
 
 public class OllamaTestGeneratorWindow : EditorWindow
 {
-    // 関数（メソッド）の情報を安全に保持する構造体
     private struct MethodDefinition
     {
         public string className;
@@ -41,7 +40,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
     private UnityWebRequest currentRequest;
     private Action<string> onCommunicationComplete;
 
-    // 個別撃破ループ用の管理変数
     private List<MethodDefinition> targetMethods = new List<MethodDefinition>();
     private StringBuilder finalSpecTable = new StringBuilder();
     private int currentMethodIndex = 0;
@@ -55,7 +53,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
     private void OnGUI()
     {
-        GUILayout.Label("Ollama テスト生成パイプライン (個別関数・捏造ゼロ版)", EditorStyles.boldLabel);
+        GUILayout.Label("Ollama テスト生成パイプライン (手動実行版)", EditorStyles.boldLabel);
 
         modelName = EditorGUILayout.TextField("使用モデル名", modelName);
         savePath = EditorGUILayout.TextField("保存パス", savePath);
@@ -66,7 +64,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
         EditorGUI.BeginDisabledGroup(isProcessing);
 
         // -------------------------------------------------------------
-        // フェーズ 1: 仕様書の生成 (ファイル読み込み・関数分割・個別撃破)
+        // フェーズ 1: 仕様書の生成
         // -------------------------------------------------------------
         GUILayout.Label("【フェーズ 1】", EditorStyles.miniBoldLabel);
         if (GUILayout.Button("1. 変更関数を抽出し、仕様書(_Spec.txt)を自動生成", GUILayout.Height(35)))
@@ -90,6 +88,31 @@ public class OllamaTestGeneratorWindow : EditorWindow
         }
         EditorGUI.EndDisabledGroup();
 
+        EditorGUILayout.Space();
+
+        // -------------------------------------------------------------
+        // フェーズ 3: テストの手動実行 (★新設)
+        // -------------------------------------------------------------
+        GUILayout.Label("【フェーズ 3】", EditorStyles.miniBoldLabel);
+        bool testCodeExists = File.Exists(savePath);
+
+        // Unityが現在コンパイル中（裏でぐるぐる中）かどうかもチェックし、コンパイル中はボタンを押せなくする
+        bool isCompiling = EditorApplication.isCompiling;
+
+        EditorGUI.BeginDisabledGroup(!testCodeExists || isCompiling);
+
+        string buttonText = isCompiling ? "Unityコンパイル中..." : "3. 生成されたテストを手動実行 (Test Runner)";
+        if (GUILayout.Button(buttonText, GUILayout.Height(35)))
+        {
+            RunAllEditModeTests();
+        }
+        EditorGUI.EndDisabledGroup();
+
+        if (isCompiling)
+        {
+            EditorGUILayout.HelpBox("Unityが新しいスクリプトをコンパイル（ビルド）しています。終わるまで少々お待ちください...", MessageType.Warning);
+        }
+
         EditorGUI.EndDisabledGroup();
 
         if (isProcessing)
@@ -105,12 +128,8 @@ public class OllamaTestGeneratorWindow : EditorWindow
         }
     }
 
-    // =================================================================
-    // フェーズ 1: ファイル読み込み ➔ 関数分割 ➔ 個別撃破運用版
-    // =================================================================
     private void ExecutePhase1()
     {
-        // ① GitDiffからは「変更されたファイル名」のリストだけを安全に取得する (--name-only)
         string gitDiffNameOnly = GetGitDiffNameOnly();
         if (string.IsNullOrEmpty(gitDiffNameOnly))
         {
@@ -118,39 +137,33 @@ public class OllamaTestGeneratorWindow : EditorWindow
             return;
         }
 
-        // ② 変更されたファイルを直接開き、中にある関数を構造体リストとしてすべて抽出する
         targetMethods = ExtractAllMethodsFromChangedFiles(gitDiffNameOnly);
 
         if (targetMethods.Count == 0)
         {
-            EditorUtility.DisplayDialog("警告", "変更されたファイルから有効な関数定義（public/private等）が見つかりませんでした。", "OK");
+            EditorUtility.DisplayDialog("警告", "変更されたファイルから有効な関数定義が見つかりませんでした。", "OK");
             return;
         }
 
-        // 初期化
         finalSpecTable.Clear();
         finalSpecTable.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
         finalSpecTable.AppendLine("|---|---|---|---|---|---|---|");
         currentMethodIndex = 0;
         globalCaseNumber = 1;
 
-        // ③ 個別撃破ループを開始
         ProcessNextMethod();
     }
 
-    // 非同期通信の完了を待って、再帰的にループを回す関数
     private void ProcessNextMethod()
     {
         if (currentMethodIndex >= targetMethods.Count)
         {
-            // ⑤ すべての関数の処理が完了したらファイルに一括書き出し
             SaveFinalSpec(finalSpecTable.ToString());
             return;
         }
 
         MethodDefinition currentMethod = targetMethods[currentMethodIndex];
 
-        // ② ①からテストケース「のみ」を生成する (AIには外枠の型定義しか教えない)
         StringBuilder sb = new StringBuilder();
         sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【対象関数の引数定義】の型を解析し、高品質なテストケースのバリエーションを日本語のMarkdownの表形式で出力してください。");
         sb.AppendLine();
@@ -166,13 +179,9 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine("【対象関数の引数定義】");
         sb.AppendLine($"引数の情報: {currentMethod.signature}");
 
-        // AIからの返答が到着したあとの処理
         onCommunicationComplete = (response) =>
         {
-            // ④ ②と③を合わせてテストケースにする (C#側で安全にドッキング)
             globalCaseNumber = AppendMethodCasesToTable(finalSpecTable, response, currentMethod, globalCaseNumber);
-
-            // 次の関数の処理へ進む
             currentMethodIndex++;
             ProcessNextMethod();
         };
@@ -180,7 +189,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
         StartSendPrompt(sb.ToString());
     }
 
-    // 🛠️ Gitから変更された「ファイルパスの一覧」だけを綺麗に貰う（中身は見ない）
     private string GetGitDiffNameOnly()
     {
         try
@@ -211,7 +219,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
         }
     }
 
-    // 🛠️ 変更されたC#ファイルを直接開き、正規表現で関数定義（シグネチャ）を全抽出する
     private List<MethodDefinition> ExtractAllMethodsFromChangedFiles(string nameOnlyDiff)
     {
         List<MethodDefinition> methods = new List<MethodDefinition>();
@@ -230,12 +237,10 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
                 string currentClass = Path.GetFileNameWithoutExtension(filePath);
 
-                // ファイル全体を上から直接スキャン
                 foreach (string fileLine in File.ReadLines(fullPath, Encoding.UTF8))
                 {
                     string trimmedLine = fileLine.Trim();
 
-                    // クラス名の正確な特定
                     if (trimmedLine.Contains("class ") && !trimmedLine.StartsWith("//"))
                     {
                         string[] parts = trimmedLine.Split(new[] { "class " }, StringSplitOptions.None);
@@ -246,7 +251,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
                         continue;
                     }
 
-                    // メソッド定義行の抽出 (中身の数式やreturn文はここで自動的に弾かれる)
                     if ((trimmedLine.StartsWith("public ") || trimmedLine.StartsWith("private ") || trimmedLine.StartsWith("protected "))
                         && trimmedLine.Contains("(") && trimmedLine.Contains(")"))
                     {
@@ -273,7 +277,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
         return methods;
     }
 
-    // 🛠️ AIが作ったケース一覧をバラして、確定している本物のクラス名・関数名を流し込む
     private int AppendMethodCasesToTable(StringBuilder tableBuilder, string lLMResponse, MethodDefinition method, int startCaseNumber)
     {
         int caseNumber = startCaseNumber;
@@ -295,7 +298,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
                         string expected = columns[2].Trim();
                         string reason = columns[3].Trim();
 
-                        // ★C#側でホールドしていた絶対確実なデータを結合
                         tableBuilder.AppendLine($"| {caseNumber} | {method.className} | {method.methodName} | {caseName} | {inputValue} | {expected} | {reason} |");
                         caseNumber++;
                     }
@@ -303,7 +305,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
             }
         }
 
-        // パース失敗時のセーフティ
         if (caseNumber == startCaseNumber)
         {
             tableBuilder.AppendLine($"| {caseNumber} | {method.className} | {method.methodName} | AI出力パースエラー | - | - | {lLMResponse.Replace("\n", " ")} |");
@@ -313,7 +314,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
         return caseNumber;
     }
 
-    // 🛠️ ⑤ 最終的な仕様書の保存
     private void SaveFinalSpec(string finalTableText)
     {
         string specPath = savePath.Replace(".cs", "_Spec.txt");
@@ -323,12 +323,9 @@ public class OllamaTestGeneratorWindow : EditorWindow
         File.WriteAllText(specPath, finalTableText, Encoding.UTF8);
         AssetDatabase.Refresh();
 
-        EditorUtility.DisplayDialog("成功", "ステップ1完了！\nファイルを関数ごとに完全分解し、捏造の余地をゼロにした高精度な仕様書(_Spec.txt)を自動生成しました。", "OK");
+        EditorUtility.DisplayDialog("成功", "ステップ1完了！\n仕様書(_Spec.txt)を手動用に自動生成しました。", "OK");
     }
 
-    // =================================================================
-    // フェーズ 2: 仕様書 ➔ テストコード作成 (コンパイルエラー対策版)
-    // =================================================================
     private void ExecutePhase2(string specPath)
     {
         if (!File.Exists(specPath)) return;
@@ -340,8 +337,8 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine("## CRITICAL RULES FOR IMPLEMENTATION:");
         sb.AppendLine("1. Implement a dedicated [Test] method for EVERY single row defined in the specification table.");
         sb.AppendLine("2. You MUST use the exact class name from '対象クラス名' and the exact method name from '対象メソッド名' columns specified in the table.");
-        sb.AppendLine("3. STATIC METHOD CHECK: If the target method is a static method (or you are calling it directly), call it via 'ClassName.MethodName(...)'. Do NOT use 'new ClassName().MethodName(...)' if it causes a compile error.");
-        sb.AppendLine("4. DO NOT WRITE UNCHECKED OVERFLOWS: Never write 'int.MaxValue + 1' or 'int.MinValue - 1' directly in the code as it causes a literal overflow compile error (CS0220). Use checked contexts or variables if needed, or stick to valid type boundaries.");
+        sb.AppendLine("3. STATIC METHOD CHECK: If the target method is a static method, call it via 'ClassName.MethodName(...)'. Do NOT use 'new ClassName().MethodName(...)'.");
+        sb.AppendLine("4. DO NOT WRITE UNCHECKED OVERFLOWS: Never write 'int.MaxValue + 1' or 'int.MinValue - 1' directly in the code as it causes a literal overflow compile error (CS0220).");
         sb.AppendLine("5. Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
         sb.AppendLine("6. Do NOT re-define or implement the source classes to avoid duplicate class errors.");
         sb.AppendLine("7. Do NOT inherit MonoBehaviour.");
@@ -350,25 +347,40 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine(specContent);
         sb.AppendLine();
         sb.AppendLine("## C# Code Output (Start from here) ##");
-        // ★ using System; と using NUnit.Framework; を先回りして提示
         sb.Append("using System;\nusing NUnit.Framework;\n\n");
 
         onCommunicationComplete = (response) =>
         {
-            // 先回りして削ったヘッダーを合体させて保存
             string codeText = "using System;\nusing NUnit.Framework;\n\n" + TrimText(response);
 
             string folder = Path.GetDirectoryName(savePath);
             if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
 
             File.WriteAllText(savePath, codeText, Encoding.UTF8);
+
+            // アセット更新（勝手にテストを走らせるフラグは撤廃）
             AssetDatabase.Refresh();
 
-            EditorUtility.DisplayDialog("成功", $"ステップ2完了！\nコンパイルエラーを修正したテストコードを保存しました:\n{savePath}", "OK");
+            EditorUtility.DisplayDialog("成功", $"ステップ2完了！\nテストコードを生成しました。Unityのコンパイルが完了したら『3』のボタンから手動実行できます。\n{savePath}", "OK");
         };
 
         StartSendPrompt(sb.ToString());
     }
+
+    // ★ ボタンから手動で呼び出せるテスト実行メソッド
+    private static void RunAllEditModeTests()
+    {
+        var testRunnerApi = ScriptableObject.CreateInstance<UnityEditor.TestTools.TestRunner.Api.TestRunnerApi>();
+        testRunnerApi.RegisterCallbacks(new TestResultCallbacks());
+
+        var filter = new UnityEditor.TestTools.TestRunner.Api.Filter
+        {
+            testMode = UnityEditor.TestTools.TestRunner.Api.TestMode.EditMode
+        };
+
+        testRunnerApi.Execute(new UnityEditor.TestTools.TestRunner.Api.ExecutionSettings(filter));
+    }
+
     private void StartSendPrompt(string prompt)
     {
         isProcessing = true;
@@ -401,9 +413,8 @@ public class OllamaTestGeneratorWindow : EditorWindow
             string jsonResponse = currentRequest.downloadHandler.text;
             OllamaResponse responseData = JsonUtility.FromJson<OllamaResponse>(jsonResponse);
 
-            // 通信が終わったらメイン処理のActionを叩く
             var callback = onCommunicationComplete;
-            EndProcessing(); // 次のリクエストのために先にフラグをリセット
+            EndProcessing();
             callback?.Invoke(responseData.response);
         }
     }
@@ -426,16 +437,10 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         if (startIndex != -1) text = text.Substring(startIndex);
 
-        // 先回りして追加している最上部の using 宣言が AI の出力と重複した場合にお掃除する
-        if (text.Contains("using System;"))
-        {
-            text = text.Replace("using System;", "").Trim();
-        }
-        if (text.Contains("using NUnit.Framework;"))
-        {
-            text = text.Replace("using NUnit.Framework;", "").Trim();
-        }
+        if (text.Contains("using System;")) text = text.Replace("using System;", "").Trim();
+        if (text.Contains("using NUnit.Framework;")) text = text.Replace("using NUnit.Framework;", "").Trim();
         return text.Trim();
     }
+
     private void OnDestroy() { EndProcessing(); }
 }
