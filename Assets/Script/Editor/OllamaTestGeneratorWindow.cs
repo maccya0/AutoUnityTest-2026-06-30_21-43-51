@@ -95,9 +95,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
     // =================================================================
     // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
     // =================================================================
-    // =================================================================
-    // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
-    // =================================================================
     private void ExecutePhase1()
     {
         string gitDiff = GetGitDiff();
@@ -117,8 +114,11 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine("2. 【複数条件網羅（MCC/MCDC準拠）】: IF文の条件式などで AND(&&) や OR(||) が使用されている場合、または複数の入力値が影響し合う場合は、それぞれの条件の真偽(True/False)が組み合わさる主要なバリエーションを網羅させてください。");
         sb.AppendLine("3. 【異常系・エッジケース】: 0（ゼロ）、負の値、null、空文字、配列の境界外、想定外の不正な入力値によってプログラムがクラッシュしないか検証するエッジケースを最低1つ以上含めてください。");
         sb.AppendLine();
+        sb.AppendLine("## ⚠️ メソッド名・クラス名の絶対厳守ルール（捏造厳禁）：");
+        sb.AppendLine("・【対象メソッド名】の列には、必ず【変更内容】の『公開関数:』や『非公開関数:』の直後に書かれている【実際のメソッド名（例: Add）】を1文字も変えずにそのまま記述してください。");
+        sb.AppendLine("・❌絶対にやってはならないこと：戻り値の計算内容（例: a * b）を見て、勝手にメソッド名を「Multiply」などと想像で書き換えてはなりません。コードがバグっていて掛け算になっていても、メソッド名が「Add」なら、対象メソッド名は必ず「Add」にしてください。");
+        sb.AppendLine();
         sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| 1 | ...）だけを実直に出力してください。");
-        sb.AppendLine("⚠️最重要：テスト対象となる「正確なクラス名」と「正確なメソッド名」を【変更内容】から読み取り、必ず表の該当する列にそのまま記入してください。");
         sb.AppendLine();
         sb.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
         sb.AppendLine("|---|---|---|---|---|---|---|");
@@ -138,7 +138,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
             string folder = Path.GetDirectoryName(specPath);
             if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
 
-            File.WriteAllText(specPath, finalResponse, Encoding.UTF8);
+            File.WriteAllText(savePath, finalResponse, Encoding.UTF8);
             AssetDatabase.Refresh();
 
             EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n高精度な仕様書を作成しました。\nファイルを確認して調整後、ステップ2へ進んでください。", "OK");
