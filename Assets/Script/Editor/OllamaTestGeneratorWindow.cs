@@ -84,106 +84,185 @@ public class OllamaTestGeneratorWindow : EditorWindow
     }
 
     // =================================================================
-    // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
+    // フェーズ 1: 5ステップ分割運用版 (仕様書作成)
     // =================================================================
     private void ExecutePhase1()
     {
+        // -------------------------------------------------------------
+        // ① GitDiffで差分を取る
+        // -------------------------------------------------------------
         string gitDiff = GetGitDiff();
         if (string.IsNullOrEmpty(gitDiff))
         {
-            EditorUtility.DisplayDialog("通知", "指定されたフォルダに変更されたコードがありませんでした。", "OK");
+            EditorUtility.DisplayDialog("通知", "変更されたコードがありませんでした。", "OK");
             return;
         }
 
-        // 数式や中身を完全に消し去った「関数の枠組みだけ」のテキスト
-        string cleanDiffDescription = MaskGitDiff(gitDiff);
+        // -------------------------------------------------------------
+        // ③ クラス名と関数名を取得する (C#側で100%正確に特定)
+        // -------------------------------------------------------------
+        string targetClass = "UnknownClass";
+        string targetMethod = "UnknownMethod";
+        string methodSignature = "";
 
+        // 事前に差分からクラス名とメソッド名を厳密に抽出する
+        ExtractClassAndMethod(gitDiff, out targetClass, out targetMethod, out methodSignature);
+
+        if (targetClass == "UnknownClass" || targetMethod == "UnknownMethod")
+        {
+            EditorUtility.DisplayDialog("警告", "差分からクラス名またはメソッド名を特定できませんでした。通常のAssets全体で再試行するか、コミット状態を確認してください。", "OK");
+            return;
+        }
+
+        // -------------------------------------------------------------
+        // ② ①からテストケース「のみ」を生成する (LLMへのプロンプト)
+        // -------------------------------------------------------------
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【追加された関数定義】の引数の型を解析し、高品質なテストケースの『仕様一覧』を日本語のMarkdownの表形式で出力してください。");
+        sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【対象関数の引数定義】の型を解析し、高品質なテストケースのバリエーションを日本語のMarkdownの表形式で出力してください。");
         sb.AppendLine();
         sb.AppendLine("## 💡 テストケース設計の必須要件（必ずデフォルトで適用すること）：");
-        sb.AppendLine("1. 【同値分割と境界値分析】: 引数のデータ型（intなど）における上限・下限、およびその境界の前後（0、有効な最大値/最小値、無効な値など）を検証するケースを必ず含めてください。");
+        sb.AppendLine("1. 【同値分割と境界値分析】: 引数のデータ型における上限・下限、およびその境界の前後（0、有効な最大値/最小値、無効な値など）を検証するケースを必ず含めてください。");
         sb.AppendLine("2. 【異常系・エッジケース】: 0（ゼロ）、負の値、データ型の最大値・最小値によってオーバーフローや予期せぬ挙動が起きないか検証するエッジケースを必ず含めてください。");
         sb.AppendLine();
-        sb.AppendLine("## ⚠️ メソッド名・クラス名の絶対厳守ルール：");
-        sb.AppendLine("・【対象メソッド名】の列には、以下に書かれている【実際のメソッド名】を1文字も変えずにそのまま記述してください。絶対に別の名前に書き換えてはなりません。");
+        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、クラス名や関数名を自分で想像して記述することも禁止します。挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| テストケース名 | ...）だけを実直に出力してください。");
         sb.AppendLine();
-        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| 1 | ...）だけを実直に出力してください。");
+        sb.AppendLine("| テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
+        sb.AppendLine("|---|---|---|---|");
         sb.AppendLine();
-        sb.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
-        sb.AppendLine("|---|---|---|---|---|---|---|");
-        sb.AppendLine();
-        sb.AppendLine("【追加された関数定義】");
-        sb.AppendLine(cleanDiffDescription);
+        sb.AppendLine("【対象関数の引数定義】");
+        sb.AppendLine($"引数の情報: {methodSignature}");
 
+        // LLMからの返答が来答したあとの処理
         onCommunicationComplete = (response) =>
         {
-            string finalResponse = response.Trim();
-            if (!finalResponse.StartsWith("|"))
-            {
-                finalResponse = "| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |\n|---|---|---|---|---|---|---|\n" + finalResponse;
-            }
+            // -------------------------------------------------------------
+            // ④ ②と③を合わせてテストケースにする (C#側でガッチャンコ)
+            // -------------------------------------------------------------
+            string finalTable = CombineAndBuildFinalTable(response, targetClass, targetMethod);
 
+            // -------------------------------------------------------------
+            // ⑤ ④を出力する
+            // -------------------------------------------------------------
             string specPath = savePath.Replace(".cs", "_Spec.txt");
             string folder = Path.GetDirectoryName(specPath);
             if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
 
-            File.WriteAllText(specPath, finalResponse, Encoding.UTF8);
+            File.WriteAllText(specPath, finalTable, Encoding.UTF8);
             AssetDatabase.Refresh();
 
-            EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n仕様書を作成しました（_Spec.txt）。\n中身を確認・修正して、ステップ2へ進んでください。", "OK");
+            EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n5ステップ分割により、捏造のない正確な仕様書を作成しました（_Spec.txt）。", "OK");
         };
 
         StartSendPrompt(sb.ToString());
     }
 
-    // ★ 中身の数式（return a * b; など）を徹底的に排除する関数
-    private string MaskGitDiff(string rawDiff)
+    // 🛠️ 【ステップ③の実装】差分とファイルからクラス名と関数名を「絶対に嘘をつけないC#」で抜き出す
+    private void ExtractClassAndMethod(string rawDiff, out string className, out string methodName, out string signature)
     {
-        StringBuilder sb = new StringBuilder();
-        string currentClass = "UnknownClass";
+        className = "UnknownClass";
+        methodName = "UnknownMethod";
+        signature = "";
 
         using (StringReader reader = new StringReader(rawDiff))
         {
             string line;
             while ((line = reader.ReadLine()) != null)
             {
-                // クラス名の抽出を試みる
-                if (line.Contains("class "))
+                if (line.StartsWith("+++ b/"))
                 {
-                    string[] parts = line.Split(new[] { "class " }, StringSplitOptions.None);
-                    if (parts.Length > 1)
-                    {
-                        currentClass = parts[1].Split('{', ' ', ':')[0].Trim();
-                    }
-                }
+                    string filePath = line.Substring(6).Trim();
+                    className = Path.GetFileNameWithoutExtension(filePath);
 
-                if (line.StartsWith("diff") || line.StartsWith("index") || line.StartsWith("---") || line.StartsWith("+++") || line.StartsWith("@@") || line.StartsWith("-"))
-                {
-                    continue;
+                    string fullPath = Path.Combine(Directory.GetCurrentDirectory(), filePath);
+                    if (File.Exists(fullPath))
+                    {
+                        foreach (string fileLine in File.ReadLines(fullPath))
+                        {
+                            if (fileLine.Contains("class ") && !fileLine.Contains("//"))
+                            {
+                                string[] parts = fileLine.Split(new[] { "class " }, StringSplitOptions.None);
+                                if (parts.Length > 1)
+                                {
+                                    className = parts[1].Split('{', ' ', ':', '\r', '\n')[0].Trim();
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if (line.StartsWith("+"))
                 {
                     string content = line.Substring(1).Trim();
-
-                    // ★ 戻り値の計算内容（return ...）やブラケットは「AIの誤認誘発ブロック」として完全に無視
                     if (string.IsNullOrEmpty(content) || content == "{" || content == "}" || content.StartsWith("return"))
                         continue;
 
-                    // メソッドの定義行（シグネチャ）だけを抽出して分かりやすくする
                     if (content.Contains("public ") || content.Contains("private ") || content.Contains("protected "))
                     {
-                        sb.AppendLine($"- 対象クラス名: {currentClass}");
-                        sb.AppendLine($"- 追加された実際の関数シグネチャ: {content.Replace(";", "")}");
+                        signature = content.Replace(";", "").Trim();
+
+                        // シグネチャから関数名を抜き出す (例: Add(int a, int b) ➔ Add)
+                        try
+                        {
+                            string[] parts = signature.Split('(');
+                            string[] nameParts = parts[0].Split(' ');
+                            methodName = nameParts[nameParts.Length - 1].Trim();
+                        }
+                        catch
+                        {
+                            methodName = "UnknownMethod";
+                        }
                     }
                 }
             }
         }
-        return sb.ToString();
     }
 
-    // =================================================================
+    // 🛠️ 【ステップ④の実装】LLMが作ったケース一覧に、確定したクラス名と関数名を横から流し込む
+    private string CombineAndBuildFinalTable(string lLMResponse, string className, string methodName)
+    {
+        StringBuilder sb = new StringBuilder();
+        // 完成形のヘッダーを出力
+        sb.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
+        sb.AppendLine("|---|---|---|---|---|---|---|");
+
+        int caseNumber = 1;
+        using (StringReader reader = new StringReader(lLMResponse))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                line = line.Trim();
+                // 有効なデータ行（| で始まっていて、ヘッダーや区切り線ではない行）を判定
+                if (line.StartsWith("|") && !line.Contains("テストケース名") && !line.Contains("---|"))
+                {
+                    // LLMが返してきた行は 「| ケース名 | 入力値 | 期待値 | 理由 |」 になっている
+                    // これをバラして、頭に「番号」「クラス名」「関数名」をドッキングする
+                    string trimmedLine = line.TrimStart('|').TrimEnd('|');
+                    string[] columns = trimmedLine.Split('|');
+
+                    if (columns.Length >= 4)
+                    {
+                        string caseName = columns[0].Trim();
+                        string inputValue = columns[1].Trim();
+                        string expected = columns[2].Trim();
+                        string reason = columns[3].Trim();
+
+                        sb.AppendLine($"| {caseNumber} | {className} | {methodName} | {caseName} | {inputValue} | {expected} | {reason} |");
+                        caseNumber++;
+                    }
+                }
+            }
+        }
+
+        // 万が一、LLMの出力フォーマットが崩れて1行もパースできなかった場合のセーフティバッファ
+        if (caseNumber == 1)
+        {
+            sb.AppendLine($"| 1 | {className} | {methodName} | ※パースエラー。LLMの生出力を確認してください | - | - | {lLMResponse.Replace("\n", " ")} |");
+        }
+
+        return sb.ToString();
+    }    // =================================================================
     // フェーズ 2: 仕様書 ➔ テストコード作成 (ステップ ③)
     // =================================================================
     private void ExecutePhase2(string specPath)
