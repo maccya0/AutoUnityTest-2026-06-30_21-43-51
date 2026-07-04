@@ -26,10 +26,15 @@ public class OllamaTestGeneratorWindow : EditorWindow
     private string ollamaUrl = "http://localhost:11434/api/generate";
     private string modelName = "codegemma";
     private string savePath = "Assets/Script/Test/Test.cs";
+
+    // ★ 開発中のエディタスクリプト自体がテスト対象（ノイズ）になるのを防ぐためのパス制限
+    // プロジェクトの構成に合わせて「Assets/Scripts」などロジックのフォルダに変更してください
+    private string targetDiffPath = "Assets";
+
     private bool isProcessing = false;
 
     private UnityWebRequest currentRequest;
-    private Action<string> onCommunicationComplete; // 通信完了時に実行する処理
+    private Action<string> onCommunicationComplete;
 
     [MenuItem("Window/Ollama Test Generator")]
     public static void ShowWindow()
@@ -39,21 +44,21 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
     private void OnGUI()
     {
-        GUILayout.Label("Ollama テスト生成パイプライン (分割運用版)", EditorStyles.boldLabel);
+        GUILayout.Label("Ollama テスト生成パイプライン (高精度・分割版)", EditorStyles.boldLabel);
 
         modelName = EditorGUILayout.TextField("使用モデル名", modelName);
         savePath = EditorGUILayout.TextField("保存パス", savePath);
+        targetDiffPath = EditorGUILayout.TextField("Diff対象フォルダ", targetDiffPath);
 
         EditorGUILayout.Space();
 
-        // 共通の処理中ガード
         EditorGUI.BeginDisabledGroup(isProcessing);
 
         // -------------------------------------------------------------
         // フェーズ 1: 仕様書の生成 (ステップ ①・②)
         // -------------------------------------------------------------
         GUILayout.Label("【フェーズ 1】", EditorStyles.miniBoldLabel);
-        if (GUILayout.Button("1. Git差分からテスト仕様書(_Spec.txt)を生成", GUILayout.Height(35)))
+        if (GUILayout.Button("1. 境界値・条件網羅を適用した仕様書(_Spec.txt)を生成", GUILayout.Height(35)))
         {
             ExecutePhase1();
         }
@@ -67,7 +72,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
         string specPath = savePath.Replace(".cs", "_Spec.txt");
         bool specExists = File.Exists(specPath);
 
-        // 仕様書ファイルが存在しない場合はボタンを押せなくする
         EditorGUI.BeginDisabledGroup(!specExists);
         if (GUILayout.Button("2. 仕様書からテストコード(.cs)を自動生成", GUILayout.Height(35)))
         {
@@ -84,7 +88,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         if (!specExists)
         {
-            EditorGUILayout.HelpBox("まずは「1」を実行して仕様書を作成してください。", MessageType.Warning);
+            EditorGUILayout.HelpBox("まず「1」を実行して仕様書を作成してください（ツール自体の変更差分は除外フォルダ等を指定して避けてください）。", MessageType.Warning);
         }
     }
 
@@ -96,22 +100,28 @@ public class OllamaTestGeneratorWindow : EditorWindow
         string gitDiff = GetGitDiff();
         if (string.IsNullOrEmpty(gitDiff))
         {
-            EditorUtility.DisplayDialog("通知", "変更されたコード（Gitの差分）がありませんでした。", "OK");
+            EditorUtility.DisplayDialog("通知", "指定されたフォルダに変更されたコード（Gitの差分）がありませんでした。", "OK");
             return;
         }
 
-        // ★ AIの勘違い（C#コード化）を防ぐため、diffの生テキストをただの変更点テキストに超圧縮する
         string cleanDiffDescription = MaskGitDiff(gitDiff);
 
+        // ★ 境界値分析・複数条件網羅・異常系をAIへデフォルト義務化する強力なプロンプト
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine("あなたはUnityのQAエンジニアです。以下の【変更内容】だけを読み、テストケースの『仕様一覧』のみを日本語のMarkdownの表形式で出力してください。");
-        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などを出力してはなりません。また、挨拶や説明文も一切不要です。表（Table）だけを出力してください。");
+        sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【変更内容】を深く解析し、高品質なテストケースの『仕様一覧』を日本語のMarkdownの表形式で出力してください。");
         sb.AppendLine();
-        sb.AppendLine("【変更内容】");
-        sb.AppendLine(cleanDiffDescription);
+        sb.AppendLine("## 💡 テストケース設計の必須要件（必ずデフォルトで適用すること）：");
+        sb.AppendLine("1. 【同値分割と境界値分析】: 単一の代表値だけでなく、数値の比較判定、ループ条件、配列インデックスなどの上限・下限、およびその境界の前後（有効な最大値/最小値、無効な値など）を検証するケースを必ず含めてください。");
+        sb.AppendLine("2. 【複数条件網羅（MCC/MCDC準拠）】: IF文の条件式などで AND(&&) や OR(||) が使用されている場合、または複数の入力値が影響し合う場合は、それぞれの条件の真偽(True/False)が組み合わさる主要なバリエーションを網羅させてください。");
+        sb.AppendLine("3. 【異常系・エッジケース】: 0（ゼロ）、負の値、null、空文字、配列の境界外、想定外の不正な入力値によってプログラムがクラッシュしないか検証するエッジケースを最低1つ以上含めてください。");
+        sb.AppendLine();
+        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| 1 | ...）だけを実直に出力してください。");
         sb.AppendLine();
         sb.AppendLine("| 番号 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
         sb.AppendLine("|---|---|---|---|---|");
+        sb.AppendLine();
+        sb.AppendLine("【変更内容】");
+        sb.AppendLine(cleanDiffDescription);
 
         onCommunicationComplete = (response) =>
         {
@@ -128,13 +138,12 @@ public class OllamaTestGeneratorWindow : EditorWindow
             File.WriteAllText(specPath, finalResponse, Encoding.UTF8);
             AssetDatabase.Refresh();
 
-            EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n仕様書を作成しました。", "OK");
+            EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n高精度な仕様書を作成しました。\nファイルを確認して調整後、ステップ2へ進んでください。", "OK");
         };
 
         StartSendPrompt(sb.ToString());
     }
 
-    // AIにC#コードと誤認させないための、差分情報のテキスト化関数
     private string MaskGitDiff(string rawDiff)
     {
         StringBuilder sb = new StringBuilder();
@@ -143,21 +152,19 @@ public class OllamaTestGeneratorWindow : EditorWindow
             string line;
             while ((line = reader.ReadLine()) != null)
             {
-                // gitのヘッダー情報（@@ や diff --git など）や、削除された行（-）は無視
                 if (line.StartsWith("diff") || line.StartsWith("index") || line.StartsWith("---") || line.StartsWith("+++") || line.StartsWith("@@") || line.StartsWith("-"))
                 {
                     continue;
                 }
 
-                // 追加された行（+）だけを抽出
                 if (line.StartsWith("+"))
                 {
                     string content = line.Substring(1).Trim();
                     if (string.IsNullOrEmpty(content) || content == "{" || content == "}") continue;
 
-                    // コードの記号（; や public, using など）を徹底的に削るか、ただの文字にする
                     content = content.Replace(";", "");
                     content = content.Replace("public ", "公開関数: ");
+                    content = content.Replace("private ", "非公開関数: ");
                     content = content.Replace("static ", "静的: ");
                     content = content.Replace("return ", "戻り値: ");
 
@@ -167,8 +174,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
         }
         return sb.ToString();
     }
-    
-    
+
     // =================================================================
     // フェーズ 2: 仕様書 ➔ テストコード作成 (ステップ ③)
     // =================================================================
@@ -177,9 +183,9 @@ public class OllamaTestGeneratorWindow : EditorWindow
         if (!File.Exists(specPath)) return;
         string specContent = File.ReadAllText(specPath);
 
-        // AIへの指示：確定した日本語の仕様書を、そのまま1対1でC#のコードに翻訳させる
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine("You are a Unity QA Engineer. Convert the following Japanese test specification into a valid NUnit test class.");
+        sb.AppendLine("You are a Unity QA Engineer. Convert the following Japanese test specification table into a valid NUnit test class.");
+        sb.AppendLine("Please implement a dedicated [Test] method for EVERY single row defined in the specification table.");
         sb.AppendLine("Rule 1: Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
         sb.AppendLine("Rule 2: Do NOT re-define or implement the source classes (e.g. Calculator class) to avoid duplicate class errors.");
         sb.AppendLine("Rule 3: Do NOT inherit MonoBehaviour.");
@@ -189,7 +195,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         onCommunicationComplete = (response) =>
         {
-            // ③ テストコードを掃除して保存
             string codeText = TrimText(response);
 
             string folder = Path.GetDirectoryName(savePath);
@@ -211,10 +216,15 @@ public class OllamaTestGeneratorWindow : EditorWindow
     {
         try
         {
+            // ★ エディタ拡張自身が差分に入らないよう、指定されたフォルダパスの後ろに
+            // エディタ（Editor）関連ファイルを明示的に除外するGitの仕組みを付与
+            string targetPath = string.IsNullOrEmpty(targetDiffPath) ? "Assets" : targetDiffPath;
+
             System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "git",
-                Arguments = "diff",
+                // 指定パスの差分を取りつつ、ツール自身(OllamaTestGeneratorWindowなど)をdiffから完全に遮断する引数
+                Arguments = $"diff -- \"{targetPath}\" \":(exclude)*Editor*\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -267,7 +277,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
             string jsonResponse = currentRequest.downloadHandler.text;
             OllamaResponse responseData = JsonUtility.FromJson<OllamaResponse>(jsonResponse);
 
-            // コールバック経由で各フェーズの保存処理を実行
             onCommunicationComplete?.Invoke(responseData.response);
         }
 
