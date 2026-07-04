@@ -327,7 +327,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
     }
 
     // =================================================================
-    // フェーズ 2: 仕様書 ➔ テストコード作成
+    // フェーズ 2: 仕様書 ➔ テストコード作成 (コンパイルエラー対策版)
     // =================================================================
     private void ExecutePhase2(string specPath)
     {
@@ -339,20 +339,24 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine();
         sb.AppendLine("## CRITICAL RULES FOR IMPLEMENTATION:");
         sb.AppendLine("1. Implement a dedicated [Test] method for EVERY single row defined in the specification table.");
-        sb.AppendLine("2. You MUST use the exact class name from '対象クラス名' and the exact method name from '対象メソッド名' columns specified in the table. Do NOT invent or guess other names.");
-        sb.AppendLine("3. Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
-        sb.AppendLine("4. Do NOT re-define or implement the source classes to avoid duplicate class errors.");
-        sb.AppendLine("5. Do NOT inherit MonoBehaviour.");
+        sb.AppendLine("2. You MUST use the exact class name from '対象クラス名' and the exact method name from '対象メソッド名' columns specified in the table.");
+        sb.AppendLine("3. STATIC METHOD CHECK: If the target method is a static method (or you are calling it directly), call it via 'ClassName.MethodName(...)'. Do NOT use 'new ClassName().MethodName(...)' if it causes a compile error.");
+        sb.AppendLine("4. DO NOT WRITE UNCHECKED OVERFLOWS: Never write 'int.MaxValue + 1' or 'int.MinValue - 1' directly in the code as it causes a literal overflow compile error (CS0220). Use checked contexts or variables if needed, or stick to valid type boundaries.");
+        sb.AppendLine("5. Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
+        sb.AppendLine("6. Do NOT re-define or implement the source classes to avoid duplicate class errors.");
+        sb.AppendLine("7. Do NOT inherit MonoBehaviour.");
         sb.AppendLine();
         sb.AppendLine("## Japanese Test Specification ##");
         sb.AppendLine(specContent);
         sb.AppendLine();
         sb.AppendLine("## C# Code Output (Start from here) ##");
-        sb.Append("using NUnit.Framework;\n\n");
+        // ★ using System; と using NUnit.Framework; を先回りして提示
+        sb.Append("using System;\nusing NUnit.Framework;\n\n");
 
         onCommunicationComplete = (response) =>
         {
-            string codeText = "using NUnit.Framework;\n\n" + TrimText(response);
+            // 先回りして削ったヘッダーを合体させて保存
+            string codeText = "using System;\nusing NUnit.Framework;\n\n" + TrimText(response);
 
             string folder = Path.GetDirectoryName(savePath);
             if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
@@ -360,12 +364,11 @@ public class OllamaTestGeneratorWindow : EditorWindow
             File.WriteAllText(savePath, codeText, Encoding.UTF8);
             AssetDatabase.Refresh();
 
-            EditorUtility.DisplayDialog("成功", $"ステップ2完了！\nテストコードを自動生成・保存しました:\n{savePath}", "OK");
+            EditorUtility.DisplayDialog("成功", $"ステップ2完了！\nコンパイルエラーを修正したテストコードを保存しました:\n{savePath}", "OK");
         };
 
         StartSendPrompt(sb.ToString());
     }
-
     private void StartSendPrompt(string prompt)
     {
         isProcessing = true;
@@ -423,12 +426,16 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         if (startIndex != -1) text = text.Substring(startIndex);
 
-        if (text.StartsWith("using NUnit.Framework;"))
+        // 先回りして追加している最上部の using 宣言が AI の出力と重複した場合にお掃除する
+        if (text.Contains("using System;"))
         {
-            text = text.Substring("using NUnit.Framework;".Length).Trim();
+            text = text.Replace("using System;", "").Trim();
+        }
+        if (text.Contains("using NUnit.Framework;"))
+        {
+            text = text.Replace("using NUnit.Framework;", "").Trim();
         }
         return text.Trim();
     }
-
     private void OnDestroy() { EndProcessing(); }
 }
