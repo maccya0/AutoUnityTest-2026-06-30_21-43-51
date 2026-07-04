@@ -156,7 +156,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
         StartSendPrompt(sb.ToString());
     }
 
-    // 🛠️ 【ステップ③の実装】差分とファイルからクラス名と関数名を「絶対に嘘をつけないC#」で抜き出す
+    // 🛠️ 【ステップ③の修正版】Git差分のパスを正確に解析し、実際のファイルを安全に開いてクラス名と関数名を取得する
     private void ExtractClassAndMethod(string rawDiff, out string className, out string methodName, out string signature)
     {
         className = "UnknownClass";
@@ -168,40 +168,57 @@ public class OllamaTestGeneratorWindow : EditorWindow
             string line;
             while ((line = reader.ReadLine()) != null)
             {
+                // ★ 「+++ b/」で始まる行から、Gitのプレフィックスを安全に取り除いてパスを特定
                 if (line.StartsWith("+++ b/"))
                 {
-                    string filePath = line.Substring(6).Trim();
-                    className = Path.GetFileNameWithoutExtension(filePath);
+                    // 「+++ b/」の6文字をカット
+                    string relativePath = line.Substring(6).Trim();
 
-                    string fullPath = Path.Combine(Directory.GetCurrentDirectory(), filePath);
+                    // 拡張子を除いたファイル名をデフォルトのクラス名とする (例: Assets/Scripts/Calculator.cs ➔ Calculator)
+                    className = Path.GetFileNameWithoutExtension(relativePath);
+
+                    // Unityプロジェクトのルートディレクトリと結合して絶対パスを作成
+                    string projectRoot = Path.GetDirectoryName(Application.dataPath); // Assetsの1つ上の階層（Projectフォルダ）
+                    string fullPath = Path.Combine(projectRoot, relativePath);
+
+                    // ファイルが確実に存在する場合のみ、中身をスキャンして正確なクラス定義を探す
                     if (File.Exists(fullPath))
                     {
-                        foreach (string fileLine in File.ReadLines(fullPath))
+                        foreach (string fileLine in File.ReadLines(fullPath, Encoding.UTF8))
                         {
-                            if (fileLine.Contains("class ") && !fileLine.Contains("//"))
+                            string trimmedFileLine = fileLine.Trim();
+                            if (trimmedFileLine.Contains("class ") && !trimmedFileLine.StartsWith("//"))
                             {
-                                string[] parts = fileLine.Split(new[] { "class " }, StringSplitOptions.None);
+                                string[] parts = trimmedFileLine.Split(new[] { "class " }, StringSplitOptions.None);
                                 if (parts.Length > 1)
                                 {
+                                    // 「public class Calculator : MonoBehaviour」などの記述からクラス名だけを切り出す
                                     className = parts[1].Split('{', ' ', ':', '\r', '\n')[0].Trim();
                                     break;
                                 }
                             }
                         }
                     }
+                    else
+                    {
+                        UnityEngine.Debug.LogWarning($"[OllamaGen] 差分ファイルがディスク上に見つかりません。パスを確認してください: {fullPath}");
+                    }
                 }
 
+                // 変更追加行の解析
                 if (line.StartsWith("+"))
                 {
                     string content = line.Substring(1).Trim();
+                    // 戻り値の中身（数式）やブラケットは無視
                     if (string.IsNullOrEmpty(content) || content == "{" || content == "}" || content.StartsWith("return"))
                         continue;
 
+                    // メソッドの定義行（シグネチャ）を特定
                     if (content.Contains("public ") || content.Contains("private ") || content.Contains("protected "))
                     {
                         signature = content.Replace(";", "").Trim();
 
-                        // シグネチャから関数名を抜き出す (例: Add(int a, int b) ➔ Add)
+                        // シグネチャから関数名を切り出す (例: Add(int a, int b) ➔ Add)
                         try
                         {
                             string[] parts = signature.Split('(');
@@ -217,7 +234,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
             }
         }
     }
-
     // 🛠️ 【ステップ④の実装】LLMが作ったケース一覧に、確定したクラス名と関数名を横から流し込む
     private string CombineAndBuildFinalTable(string lLMResponse, string className, string methodName)
     {
