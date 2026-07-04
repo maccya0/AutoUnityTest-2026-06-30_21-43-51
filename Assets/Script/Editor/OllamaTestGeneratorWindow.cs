@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Text;
 using System.IO;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEditor;
 using UnityEngine.Networking;
@@ -23,6 +24,14 @@ public class OllamaResponse
 
 public class OllamaTestGeneratorWindow : EditorWindow
 {
+    // 関数（メソッド）の情報を安全に保持する構造体
+    private struct MethodDefinition
+    {
+        public string className;
+        public string methodName;
+        public string signature;
+    }
+
     private string ollamaUrl = "http://localhost:11434/api/generate";
     private string modelName = "codegemma";
     private string savePath = "Assets/Script/Test/Test.cs";
@@ -32,6 +41,12 @@ public class OllamaTestGeneratorWindow : EditorWindow
     private UnityWebRequest currentRequest;
     private Action<string> onCommunicationComplete;
 
+    // 個別撃破ループ用の管理変数
+    private List<MethodDefinition> targetMethods = new List<MethodDefinition>();
+    private StringBuilder finalSpecTable = new StringBuilder();
+    private int currentMethodIndex = 0;
+    private int globalCaseNumber = 1;
+
     [MenuItem("Window/Ollama Test Generator")]
     public static void ShowWindow()
     {
@@ -40,7 +55,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
     private void OnGUI()
     {
-        GUILayout.Label("Ollama テスト生成パイプライン (捏造防止版)", EditorStyles.boldLabel);
+        GUILayout.Label("Ollama テスト生成パイプライン (個別関数・捏造ゼロ版)", EditorStyles.boldLabel);
 
         modelName = EditorGUILayout.TextField("使用モデル名", modelName);
         savePath = EditorGUILayout.TextField("保存パス", savePath);
@@ -51,10 +66,10 @@ public class OllamaTestGeneratorWindow : EditorWindow
         EditorGUI.BeginDisabledGroup(isProcessing);
 
         // -------------------------------------------------------------
-        // フェーズ 1: 仕様書の生成 (ステップ ①・②)
+        // フェーズ 1: 仕様書の生成 (ファイル読み込み・関数分割・個別撃破)
         // -------------------------------------------------------------
         GUILayout.Label("【フェーズ 1】", EditorStyles.miniBoldLabel);
-        if (GUILayout.Button("1. 境界値・条件網羅を適用した仕様書(_Spec.txt)を生成", GUILayout.Height(35)))
+        if (GUILayout.Button("1. 変更関数を抽出し、仕様書(_Spec.txt)を自動生成", GUILayout.Height(35)))
         {
             ExecutePhase1();
         }
@@ -62,7 +77,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
         EditorGUILayout.Space();
 
         // -------------------------------------------------------------
-        // フェーズ 2: テストコードの生成 (ステップ ③)
+        // フェーズ 2: テストコードの生成
         // -------------------------------------------------------------
         GUILayout.Label("【フェーズ 2】", EditorStyles.miniBoldLabel);
         string specPath = savePath.Replace(".cs", "_Spec.txt");
@@ -79,181 +94,197 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         if (isProcessing)
         {
-            EditorGUILayout.HelpBox("Ollamaが通信・思考中です。しばらくお待ちください...", MessageType.Info);
+            if (targetMethods.Count > 0)
+            {
+                EditorGUILayout.HelpBox($"Ollama思考中... ({currentMethodIndex + 1} / {targetMethods.Count} つ目の関数を処理中)", MessageType.Info);
+            }
+            else
+            {
+                EditorGUILayout.HelpBox("Ollamaが通信・思考中です。しばらくお待ちください...", MessageType.Info);
+            }
         }
     }
 
     // =================================================================
-    // フェーズ 1: 5ステップ分割運用版 (仕様書作成)
+    // フェーズ 1: ファイル読み込み ➔ 関数分割 ➔ 個別撃破運用版
     // =================================================================
     private void ExecutePhase1()
     {
-        // -------------------------------------------------------------
-        // ① GitDiffで差分を取る
-        // -------------------------------------------------------------
-        string gitDiff = GetGitDiff();
-        if (string.IsNullOrEmpty(gitDiff))
+        // ① GitDiffからは「変更されたファイル名」のリストだけを安全に取得する (--name-only)
+        string gitDiffNameOnly = GetGitDiffNameOnly();
+        if (string.IsNullOrEmpty(gitDiffNameOnly))
         {
             EditorUtility.DisplayDialog("通知", "変更されたコードがありませんでした。", "OK");
             return;
         }
 
-        // -------------------------------------------------------------
-        // ③ クラス名と関数名を取得する (C#側で100%正確に特定)
-        // -------------------------------------------------------------
-        string targetClass = "UnknownClass";
-        string targetMethod = "UnknownMethod";
-        string methodSignature = "";
+        // ② 変更されたファイルを直接開き、中にある関数を構造体リストとしてすべて抽出する
+        targetMethods = ExtractAllMethodsFromChangedFiles(gitDiffNameOnly);
 
-        // 事前に差分からクラス名とメソッド名を厳密に抽出する
-        ExtractClassAndMethod(gitDiff, out targetClass, out targetMethod, out methodSignature);
-
-        if (targetClass == "UnknownClass" || targetMethod == "UnknownMethod")
+        if (targetMethods.Count == 0)
         {
-            EditorUtility.DisplayDialog("警告", "差分からクラス名またはメソッド名を特定できませんでした。通常のAssets全体で再試行するか、コミット状態を確認してください。", "OK");
+            EditorUtility.DisplayDialog("警告", "変更されたファイルから有効な関数定義（public/private等）が見つかりませんでした。", "OK");
             return;
         }
 
-        // -------------------------------------------------------------
-        // ② ①からテストケース「のみ」を生成する (LLMへのプロンプト)
-        // -------------------------------------------------------------
+        // 初期化
+        finalSpecTable.Clear();
+        finalSpecTable.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
+        finalSpecTable.AppendLine("|---|---|---|---|---|---|---|");
+        currentMethodIndex = 0;
+        globalCaseNumber = 1;
+
+        // ③ 個別撃破ループを開始
+        ProcessNextMethod();
+    }
+
+    // 非同期通信の完了を待って、再帰的にループを回す関数
+    private void ProcessNextMethod()
+    {
+        if (currentMethodIndex >= targetMethods.Count)
+        {
+            // ⑤ すべての関数の処理が完了したらファイルに一括書き出し
+            SaveFinalSpec(finalSpecTable.ToString());
+            return;
+        }
+
+        MethodDefinition currentMethod = targetMethods[currentMethodIndex];
+
+        // ② ①からテストケース「のみ」を生成する (AIには外枠の型定義しか教えない)
         StringBuilder sb = new StringBuilder();
         sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【対象関数の引数定義】の型を解析し、高品質なテストケースのバリエーションを日本語のMarkdownの表形式で出力してください。");
         sb.AppendLine();
-        sb.AppendLine("## 💡 テストケース設計の必須要件（必ずデフォルトで適用すること）：");
-        sb.AppendLine("1. 【同値分割と境界値分析】: 引数のデータ型における上限・下限、およびその境界の前後（0、有効な最大値/最小値、無効な値など）を検証するケースを必ず含めてください。");
-        sb.AppendLine("2. 【異常系・エッジケース】: 0（ゼロ）、負の値、データ型の最大値・最小値によってオーバーフローや予期せぬ挙動が起きないか検証するエッジケースを必ず含めてください。");
+        sb.AppendLine("## 💡 テストケース設計の必須要件：");
+        sb.AppendLine("1. 【同値分割と境界値分析】: 引数のデータ型における上限・下限、およびその境界の前後（0、有効な最大値/最小値、無効な値など）を検証するケースを含めてください。");
+        sb.AppendLine("2. 【異常系・エッジケース】: 0（ゼロ）、負の値、データ型の最大値・最小値によるエッジケースを最低1つ以上含めてください。");
         sb.AppendLine();
-        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、クラス名や関数名を自分で想像して記述することも禁止します。挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| テストケース名 | ...）だけを実直に出力してください。");
+        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、クラス名や関数名を自分で想像して記述することも禁止します。挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| テストケース名 | ...）だけを出力してください。");
         sb.AppendLine();
         sb.AppendLine("| テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
         sb.AppendLine("|---|---|---|---|");
         sb.AppendLine();
         sb.AppendLine("【対象関数の引数定義】");
-        sb.AppendLine($"引数の情報: {methodSignature}");
+        sb.AppendLine($"引数の情報: {currentMethod.signature}");
 
-        // LLMからの返答が来答したあとの処理
+        // AIからの返答が到着したあとの処理
         onCommunicationComplete = (response) =>
         {
-            // -------------------------------------------------------------
-            // ④ ②と③を合わせてテストケースにする (C#側でガッチャンコ)
-            // -------------------------------------------------------------
-            string finalTable = CombineAndBuildFinalTable(response, targetClass, targetMethod);
+            // ④ ②と③を合わせてテストケースにする (C#側で安全にドッキング)
+            globalCaseNumber = AppendMethodCasesToTable(finalSpecTable, response, currentMethod, globalCaseNumber);
 
-            // -------------------------------------------------------------
-            // ⑤ ④を出力する
-            // -------------------------------------------------------------
-            string specPath = savePath.Replace(".cs", "_Spec.txt");
-            string folder = Path.GetDirectoryName(specPath);
-            if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
-
-            File.WriteAllText(specPath, finalTable, Encoding.UTF8);
-            AssetDatabase.Refresh();
-
-            EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n5ステップ分割により、捏造のない正確な仕様書を作成しました（_Spec.txt）。", "OK");
+            // 次の関数の処理へ進む
+            currentMethodIndex++;
+            ProcessNextMethod();
         };
 
         StartSendPrompt(sb.ToString());
     }
 
-    // 🛠️ 【ステップ③の修正版】Git差分のパスを正確に解析し、実際のファイルを安全に開いてクラス名と関数名を取得する
-    private void ExtractClassAndMethod(string rawDiff, out string className, out string methodName, out string signature)
+    // 🛠️ Gitから変更された「ファイルパスの一覧」だけを綺麗に貰う（中身は見ない）
+    private string GetGitDiffNameOnly()
     {
-        className = "UnknownClass";
-        methodName = "UnknownMethod";
-        signature = "";
-
-        using (StringReader reader = new StringReader(rawDiff))
+        try
         {
-            string line;
-            while ((line = reader.ReadLine()) != null)
+            string targetPath = string.IsNullOrEmpty(targetDiffPath) ? "Assets" : targetDiffPath;
+            System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo
             {
-                // ★ 「+++ b/」で始まる行から、Gitのプレフィックスを安全に取り除いてパスを特定
-                if (line.StartsWith("+++ b/"))
+                FileName = "git",
+                Arguments = $"diff --name-only -- \"{targetPath}\" \":(exclude)*Editor*\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = Path.GetDirectoryName(Application.dataPath)
+            };
+
+            using (System.Diagnostics.Process process = System.Diagnostics.Process.Start(startInfo))
+            {
+                string output = process.StandardOutput.ReadToEnd();
+                process.WaitForExit();
+                return output.Trim();
+            }
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogError($"Gitエラー: {e.Message}");
+            return string.Empty;
+        }
+    }
+
+    // 🛠️ 変更されたC#ファイルを直接開き、正規表現で関数定義（シグネチャ）を全抽出する
+    private List<MethodDefinition> ExtractAllMethodsFromChangedFiles(string nameOnlyDiff)
+    {
+        List<MethodDefinition> methods = new List<MethodDefinition>();
+        string projectRoot = Path.GetDirectoryName(Application.dataPath);
+
+        using (StringReader reader = new StringReader(nameOnlyDiff))
+        {
+            string filePath;
+            while ((filePath = reader.ReadLine()) != null)
+            {
+                filePath = filePath.Trim();
+                if (string.IsNullOrEmpty(filePath) || !filePath.EndsWith(".cs")) continue;
+
+                string fullPath = Path.Combine(projectRoot, filePath);
+                if (!File.Exists(fullPath)) continue;
+
+                string currentClass = Path.GetFileNameWithoutExtension(filePath);
+
+                // ファイル全体を上から直接スキャン
+                foreach (string fileLine in File.ReadLines(fullPath, Encoding.UTF8))
                 {
-                    // 「+++ b/」の6文字をカット
-                    string relativePath = line.Substring(6).Trim();
+                    string trimmedLine = fileLine.Trim();
 
-                    // 拡張子を除いたファイル名をデフォルトのクラス名とする (例: Assets/Scripts/Calculator.cs ➔ Calculator)
-                    className = Path.GetFileNameWithoutExtension(relativePath);
-
-                    // Unityプロジェクトのルートディレクトリと結合して絶対パスを作成
-                    string projectRoot = Path.GetDirectoryName(Application.dataPath); // Assetsの1つ上の階層（Projectフォルダ）
-                    string fullPath = Path.Combine(projectRoot, relativePath);
-
-                    // ファイルが確実に存在する場合のみ、中身をスキャンして正確なクラス定義を探す
-                    if (File.Exists(fullPath))
+                    // クラス名の正確な特定
+                    if (trimmedLine.Contains("class ") && !trimmedLine.StartsWith("//"))
                     {
-                        foreach (string fileLine in File.ReadLines(fullPath, Encoding.UTF8))
+                        string[] parts = trimmedLine.Split(new[] { "class " }, StringSplitOptions.None);
+                        if (parts.Length > 1)
                         {
-                            string trimmedFileLine = fileLine.Trim();
-                            if (trimmedFileLine.Contains("class ") && !trimmedFileLine.StartsWith("//"))
-                            {
-                                string[] parts = trimmedFileLine.Split(new[] { "class " }, StringSplitOptions.None);
-                                if (parts.Length > 1)
-                                {
-                                    // 「public class Calculator : MonoBehaviour」などの記述からクラス名だけを切り出す
-                                    className = parts[1].Split('{', ' ', ':', '\r', '\n')[0].Trim();
-                                    break;
-                                }
-                            }
+                            currentClass = parts[1].Split('{', ' ', ':', '\r', '\n')[0].Trim();
                         }
-                    }
-                    else
-                    {
-                        UnityEngine.Debug.LogWarning($"[OllamaGen] 差分ファイルがディスク上に見つかりません。パスを確認してください: {fullPath}");
-                    }
-                }
-
-                // 変更追加行の解析
-                if (line.StartsWith("+"))
-                {
-                    string content = line.Substring(1).Trim();
-                    // 戻り値の中身（数式）やブラケットは無視
-                    if (string.IsNullOrEmpty(content) || content == "{" || content == "}" || content.StartsWith("return"))
                         continue;
+                    }
 
-                    // メソッドの定義行（シグネチャ）を特定
-                    if (content.Contains("public ") || content.Contains("private ") || content.Contains("protected "))
+                    // メソッド定義行の抽出 (中身の数式やreturn文はここで自動的に弾かれる)
+                    if ((trimmedLine.StartsWith("public ") || trimmedLine.StartsWith("private ") || trimmedLine.StartsWith("protected "))
+                        && trimmedLine.Contains("(") && trimmedLine.Contains(")"))
                     {
-                        signature = content.Replace(";", "").Trim();
-
-                        // シグネチャから関数名を切り出す (例: Add(int a, int b) ➔ Add)
+                        string signature = trimmedLine.Replace(";", "").Trim();
+                        string methodName = "UnknownMethod";
                         try
                         {
                             string[] parts = signature.Split('(');
                             string[] nameParts = parts[0].Split(' ');
                             methodName = nameParts[nameParts.Length - 1].Trim();
                         }
-                        catch
+                        catch { continue; }
+
+                        methods.Add(new MethodDefinition
                         {
-                            methodName = "UnknownMethod";
-                        }
+                            className = currentClass,
+                            methodName = methodName,
+                            signature = signature
+                        });
                     }
                 }
             }
         }
+        return methods;
     }
-    // 🛠️ 【ステップ④の実装】LLMが作ったケース一覧に、確定したクラス名と関数名を横から流し込む
-    private string CombineAndBuildFinalTable(string lLMResponse, string className, string methodName)
-    {
-        StringBuilder sb = new StringBuilder();
-        // 完成形のヘッダーを出力
-        sb.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
-        sb.AppendLine("|---|---|---|---|---|---|---|");
 
-        int caseNumber = 1;
+    // 🛠️ AIが作ったケース一覧をバラして、確定している本物のクラス名・関数名を流し込む
+    private int AppendMethodCasesToTable(StringBuilder tableBuilder, string lLMResponse, MethodDefinition method, int startCaseNumber)
+    {
+        int caseNumber = startCaseNumber;
         using (StringReader reader = new StringReader(lLMResponse))
         {
             string line;
             while ((line = reader.ReadLine()) != null)
             {
                 line = line.Trim();
-                // 有効なデータ行（| で始まっていて、ヘッダーや区切り線ではない行）を判定
                 if (line.StartsWith("|") && !line.Contains("テストケース名") && !line.Contains("---|"))
                 {
-                    // LLMが返してきた行は 「| ケース名 | 入力値 | 期待値 | 理由 |」 になっている
-                    // これをバラして、頭に「番号」「クラス名」「関数名」をドッキングする
                     string trimmedLine = line.TrimStart('|').TrimEnd('|');
                     string[] columns = trimmedLine.Split('|');
 
@@ -264,22 +295,39 @@ public class OllamaTestGeneratorWindow : EditorWindow
                         string expected = columns[2].Trim();
                         string reason = columns[3].Trim();
 
-                        sb.AppendLine($"| {caseNumber} | {className} | {methodName} | {caseName} | {inputValue} | {expected} | {reason} |");
+                        // ★C#側でホールドしていた絶対確実なデータを結合
+                        tableBuilder.AppendLine($"| {caseNumber} | {method.className} | {method.methodName} | {caseName} | {inputValue} | {expected} | {reason} |");
                         caseNumber++;
                     }
                 }
             }
         }
 
-        // 万が一、LLMの出力フォーマットが崩れて1行もパースできなかった場合のセーフティバッファ
-        if (caseNumber == 1)
+        // パース失敗時のセーフティ
+        if (caseNumber == startCaseNumber)
         {
-            sb.AppendLine($"| 1 | {className} | {methodName} | ※パースエラー。LLMの生出力を確認してください | - | - | {lLMResponse.Replace("\n", " ")} |");
+            tableBuilder.AppendLine($"| {caseNumber} | {method.className} | {method.methodName} | AI出力パースエラー | - | - | {lLMResponse.Replace("\n", " ")} |");
+            caseNumber++;
         }
 
-        return sb.ToString();
-    }    // =================================================================
-    // フェーズ 2: 仕様書 ➔ テストコード作成 (ステップ ③)
+        return caseNumber;
+    }
+
+    // 🛠️ ⑤ 最終的な仕様書の保存
+    private void SaveFinalSpec(string finalTableText)
+    {
+        string specPath = savePath.Replace(".cs", "_Spec.txt");
+        string folder = Path.GetDirectoryName(specPath);
+        if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+
+        File.WriteAllText(specPath, finalTableText, Encoding.UTF8);
+        AssetDatabase.Refresh();
+
+        EditorUtility.DisplayDialog("成功", "ステップ1完了！\nファイルを関数ごとに完全分解し、捏造の余地をゼロにした高精度な仕様書(_Spec.txt)を自動生成しました。", "OK");
+    }
+
+    // =================================================================
+    // フェーズ 2: 仕様書 ➔ テストコード作成
     // =================================================================
     private void ExecutePhase2(string specPath)
     {
@@ -300,12 +348,10 @@ public class OllamaTestGeneratorWindow : EditorWindow
         sb.AppendLine(specContent);
         sb.AppendLine();
         sb.AppendLine("## C# Code Output (Start from here) ##");
-        // ★ AIに表のオウム返しをさせず、確実にC#コードを書かせるための先回りコード補完
         sb.Append("using NUnit.Framework;\n\n");
 
         onCommunicationComplete = (response) =>
         {
-            // 先回りして削ったヘッダーを合体させて保存
             string codeText = "using NUnit.Framework;\n\n" + TrimText(response);
 
             string folder = Path.GetDirectoryName(savePath);
@@ -318,36 +364,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
         };
 
         StartSendPrompt(sb.ToString());
-    }
-
-    private string GetGitDiff()
-    {
-        try
-        {
-            string targetPath = string.IsNullOrEmpty(targetDiffPath) ? "Assets" : targetDiffPath;
-            System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "git",
-                Arguments = $"diff -- \"{targetPath}\" \":(exclude)*Editor*\"",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WorkingDirectory = Path.GetDirectoryName(Application.dataPath)
-            };
-
-            using (System.Diagnostics.Process process = System.Diagnostics.Process.Start(startInfo))
-            {
-                string output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit();
-                return output.Trim();
-            }
-        }
-        catch (Exception e)
-        {
-            UnityEngine.Debug.LogError($"Gitエラー: {e.Message}");
-            return string.Empty;
-        }
     }
 
     private void StartSendPrompt(string prompt)
@@ -375,16 +391,18 @@ public class OllamaTestGeneratorWindow : EditorWindow
         {
             UnityEngine.Debug.LogError($"Ollamaエラー: {currentRequest.error}");
             EditorUtility.DisplayDialog("エラー", $"Ollamaとの通信に失敗しました:\n{currentRequest.error}", "OK");
+            EndProcessing();
         }
         else
         {
             string jsonResponse = currentRequest.downloadHandler.text;
             OllamaResponse responseData = JsonUtility.FromJson<OllamaResponse>(jsonResponse);
 
-            onCommunicationComplete?.Invoke(responseData.response);
+            // 通信が終わったらメイン処理のActionを叩く
+            var callback = onCommunicationComplete;
+            EndProcessing(); // 次のリクエストのために先にフラグをリセット
+            callback?.Invoke(responseData.response);
         }
-
-        EndProcessing();
     }
 
     private void EndProcessing()
@@ -405,7 +423,6 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
         if (startIndex != -1) text = text.Substring(startIndex);
 
-        // もし先回りのusingが重複して返ってきたらお掃除する
         if (text.StartsWith("using NUnit.Framework;"))
         {
             text = text.Substring("using NUnit.Framework;".Length).Trim();
