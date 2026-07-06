@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Text;
 using System.IO;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEditor;
 using UnityEngine.Networking;
@@ -23,18 +24,26 @@ public class OllamaResponse
 
 public class OllamaTestGeneratorWindow : EditorWindow
 {
+    private struct MethodDefinition
+    {
+        public string className;
+        public string methodName;
+        public string signature;
+    }
+
     private string ollamaUrl = "http://localhost:11434/api/generate";
     private string modelName = "codegemma";
     private string savePath = "Assets/Script/Test/Test.cs";
-
-    // ★ 開発中のエディタスクリプト自体がテスト対象（ノイズ）になるのを防ぐためのパス制限
-    // プロジェクトの構成に合わせて「Assets/Scripts」などロジックのフォルダに変更してください
     private string targetDiffPath = "Assets";
-
     private bool isProcessing = false;
 
     private UnityWebRequest currentRequest;
     private Action<string> onCommunicationComplete;
+
+    private List<MethodDefinition> targetMethods = new List<MethodDefinition>();
+    private StringBuilder finalSpecTable = new StringBuilder();
+    private int currentMethodIndex = 0;
+    private int globalCaseNumber = 1;
 
     [MenuItem("Window/Ollama Test Generator")]
     public static void ShowWindow()
@@ -44,7 +53,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
 
     private void OnGUI()
     {
-        GUILayout.Label("Ollama テスト生成パイプライン (高精度・分割版)", EditorStyles.boldLabel);
+        GUILayout.Label("Ollama テスト生成パイプライン (手動実行版)", EditorStyles.boldLabel);
 
         modelName = EditorGUILayout.TextField("使用モデル名", modelName);
         savePath = EditorGUILayout.TextField("保存パス", savePath);
@@ -55,10 +64,10 @@ public class OllamaTestGeneratorWindow : EditorWindow
         EditorGUI.BeginDisabledGroup(isProcessing);
 
         // -------------------------------------------------------------
-        // フェーズ 1: 仕様書の生成 (ステップ ①・②)
+        // フェーズ 1: 仕様書の生成
         // -------------------------------------------------------------
         GUILayout.Label("【フェーズ 1】", EditorStyles.miniBoldLabel);
-        if (GUILayout.Button("1. 境界値・条件網羅を適用した仕様書(_Spec.txt)を生成", GUILayout.Height(35)))
+        if (GUILayout.Button("1. 変更関数を抽出し、仕様書(_Spec.txt)を自動生成", GUILayout.Height(35)))
         {
             ExecutePhase1();
         }
@@ -66,7 +75,7 @@ public class OllamaTestGeneratorWindow : EditorWindow
         EditorGUILayout.Space();
 
         // -------------------------------------------------------------
-        // フェーズ 2: テストコードの生成 (ステップ ③)
+        // フェーズ 2: テストコードの生成
         // -------------------------------------------------------------
         GUILayout.Label("【フェーズ 2】", EditorStyles.miniBoldLabel);
         string specPath = savePath.Replace(".cs", "_Spec.txt");
@@ -79,156 +88,116 @@ public class OllamaTestGeneratorWindow : EditorWindow
         }
         EditorGUI.EndDisabledGroup();
 
+        EditorGUILayout.Space();
+
+        // -------------------------------------------------------------
+        // フェーズ 3: テストの手動実行 (★新設)
+        // -------------------------------------------------------------
+        GUILayout.Label("【フェーズ 3】", EditorStyles.miniBoldLabel);
+        bool testCodeExists = File.Exists(savePath);
+
+        // Unityが現在コンパイル中（裏でぐるぐる中）かどうかもチェックし、コンパイル中はボタンを押せなくする
+        bool isCompiling = EditorApplication.isCompiling;
+
+        EditorGUI.BeginDisabledGroup(!testCodeExists || isCompiling);
+
+        string buttonText = isCompiling ? "Unityコンパイル中..." : "3. 生成されたテストを手動実行 (Test Runner)";
+        if (GUILayout.Button(buttonText, GUILayout.Height(35)))
+        {
+            RunAllEditModeTests();
+        }
+        EditorGUI.EndDisabledGroup();
+
+        if (isCompiling)
+        {
+            EditorGUILayout.HelpBox("Unityが新しいスクリプトをコンパイル（ビルド）しています。終わるまで少々お待ちください...", MessageType.Warning);
+        }
+
         EditorGUI.EndDisabledGroup();
 
         if (isProcessing)
         {
-            EditorGUILayout.HelpBox("Ollamaが通信・思考中です。しばらくお待ちください...", MessageType.Info);
-        }
-
-        if (!specExists)
-        {
-            EditorGUILayout.HelpBox("まず「1」を実行して仕様書を作成してください（ツール自体の変更差分は除外フォルダ等を指定して避けてください）。", MessageType.Warning);
+            if (targetMethods.Count > 0)
+            {
+                EditorGUILayout.HelpBox($"Ollama思考中... ({currentMethodIndex + 1} / {targetMethods.Count} つ目の関数を処理中)", MessageType.Info);
+            }
+            else
+            {
+                EditorGUILayout.HelpBox("Ollamaが通信・思考中です。しばらくお待ちください...", MessageType.Info);
+            }
         }
     }
 
-    // =================================================================
-    // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
-    // =================================================================
-    // =================================================================
-    // フェーズ 1: Git差分 ➔ 仕様書作成 (ステップ ①・②)
-    // =================================================================
     private void ExecutePhase1()
     {
-        string gitDiff = GetGitDiff();
-        if (string.IsNullOrEmpty(gitDiff))
+        string gitDiffNameOnly = GetGitDiffNameOnly();
+        if (string.IsNullOrEmpty(gitDiffNameOnly))
         {
-            EditorUtility.DisplayDialog("通知", "指定されたフォルダに変更されたコード（Gitの差分）がありませんでした。", "OK");
+            EditorUtility.DisplayDialog("通知", "変更されたコードがありませんでした。", "OK");
             return;
         }
 
-        string cleanDiffDescription = MaskGitDiff(gitDiff);
+        targetMethods = ExtractAllMethodsFromChangedFiles(gitDiffNameOnly);
 
-        StringBuilder sb = new StringBuilder();
-        sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【変更内容】を深く解析し、高品質なテストケースの『仕様一覧』を日本語のMarkdownの表形式で出力してください。");
-        sb.AppendLine();
-        sb.AppendLine("## 💡 テストケース設計の必須要件（必ずデフォルトで適用すること）：");
-        sb.AppendLine("1. 【同値分割と境界値分析】: 単一の代表値だけでなく、数値の比較判定、ループ条件、配列インデックスなどの上限・下限、およびその境界の前後（有効な最大値/最小値、無効な値など）を検証するケースを必ず含めてください。");
-        sb.AppendLine("2. 【複数条件網羅（MCC/MCDC準拠）】: IF文の条件式などで AND(&&) や OR(||) が使用されている場合、または複数の入力値が影響し合う場合は、それぞれの条件の真偽(True/False)が組み合わさる主要なバリエーションを網羅させてください。");
-        sb.AppendLine("3. 【異常系・エッジケース】: 0（ゼロ）、負の値、null、空文字、配列の境界外、想定外の不正な入力値によってプログラムがクラッシュしないか検証するエッジケースを最低1つ以上含めてください。");
-        sb.AppendLine();
-        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| 1 | ...）だけを実直に出力してください。");
-        sb.AppendLine("⚠️最重要：テスト対象となる「正確なクラス名」と「正確なメソッド名」を【変更内容】から読み取り、必ず表の該当する列にそのまま記入してください。");
-        sb.AppendLine();
-        sb.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
-        sb.AppendLine("|---|---|---|---|---|---|---|");
-        sb.AppendLine();
-        sb.AppendLine("【変更内容】");
-        sb.AppendLine(cleanDiffDescription);
-
-        onCommunicationComplete = (response) =>
+        if (targetMethods.Count == 0)
         {
-            string finalResponse = response.Trim();
-            if (!finalResponse.StartsWith("|"))
-            {
-                finalResponse = "| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |\n|---|---|---|---|---|---|---|\n" + finalResponse;
-            }
-
-            string specPath = savePath.Replace(".cs", "_Spec.txt");
-            string folder = Path.GetDirectoryName(specPath);
-            if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
-
-            File.WriteAllText(specPath, finalResponse, Encoding.UTF8);
-            AssetDatabase.Refresh();
-
-            EditorUtility.DisplayDialog("成功", $"ステップ1完了！\n高精度な仕様書を作成しました。\nファイルを確認して調整後、ステップ2へ進んでください。", "OK");
-        };
-
-        StartSendPrompt(sb.ToString());
-    }
-    private string MaskGitDiff(string rawDiff)
-    {
-        StringBuilder sb = new StringBuilder();
-        using (StringReader reader = new StringReader(rawDiff))
-        {
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                if (line.StartsWith("diff") || line.StartsWith("index") || line.StartsWith("---") || line.StartsWith("+++") || line.StartsWith("@@") || line.StartsWith("-"))
-                {
-                    continue;
-                }
-
-                if (line.StartsWith("+"))
-                {
-                    string content = line.Substring(1).Trim();
-                    if (string.IsNullOrEmpty(content) || content == "{" || content == "}") continue;
-
-                    content = content.Replace(";", "");
-                    content = content.Replace("public ", "公開関数: ");
-                    content = content.Replace("private ", "非公開関数: ");
-                    content = content.Replace("static ", "静的: ");
-                    content = content.Replace("return ", "戻り値: ");
-
-                    sb.AppendLine($"- 変更追加点: {content}");
-                }
-            }
+            EditorUtility.DisplayDialog("警告", "変更されたファイルから有効な関数定義が見つかりませんでした。", "OK");
+            return;
         }
-        return sb.ToString();
+
+        finalSpecTable.Clear();
+        finalSpecTable.AppendLine("| 番号 | 対象クラス名 | 対象メソッド名 | テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
+        finalSpecTable.AppendLine("|---|---|---|---|---|---|---|");
+        currentMethodIndex = 0;
+        globalCaseNumber = 1;
+
+        ProcessNextMethod();
     }
 
-    // =================================================================
-    // フェーズ 2: 仕様書 ➔ テストコード作成 (ステップ ③)
-    // =================================================================
-    private void ExecutePhase2(string specPath)
+    private void ProcessNextMethod()
     {
-        if (!File.Exists(specPath)) return;
-        string specContent = File.ReadAllText(specPath);
+        if (currentMethodIndex >= targetMethods.Count)
+        {
+            SaveFinalSpec(finalSpecTable.ToString());
+            return;
+        }
+
+        MethodDefinition currentMethod = targetMethods[currentMethodIndex];
 
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine("You are a Unity QA Engineer. Convert the following Japanese test specification table into a valid NUnit test class.");
+        sb.AppendLine("あなたはUnityの極めて優秀なQAエンジニアです。以下の【対象関数の引数定義】の型を解析し、高品質なテストケースのバリエーションを日本語のMarkdownの表形式で出力してください。");
         sb.AppendLine();
-        sb.AppendLine("## CRITICAL RULES FOR IMPLEMENTATION:");
-        sb.AppendLine("1. Implement a dedicated [Test] method for EVERY single row defined in the specification table.");
-        sb.AppendLine("2. ⚠️CRITICAL: You MUST use the exact class name from '対象クラス名' and the exact method name from '対象メソッド名' specified in the table columns. Do NOT invent or guess other method names.");
-        sb.AppendLine("3. Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
-        sb.AppendLine("4. Do NOT re-define or implement the source classes (e.g. Calculator class) to avoid duplicate class errors.");
-        sb.AppendLine("5. Do NOT inherit MonoBehaviour.");
+        sb.AppendLine("## 💡 テストケース設計の必須要件：");
+        sb.AppendLine("1. 【同値分割と境界値分析】: 引数のデータ型における上限・下限、およびその境界の前後（0、有効な最大値/最小値、無効な値など）を検証するケースを含めてください。");
+        sb.AppendLine("2. 【異常系・エッジケース】: 0（ゼロ）、負の値、データ型の最大値・最小値によるエッジケースを最低1つ以上含めてください。");
         sb.AppendLine();
-        sb.AppendLine("## Japanese Test Specification ##");
-        sb.AppendLine(specContent);
+        sb.AppendLine("❌厳格なルール：絶対にC#のソースコード、クラス、関数などのプログラムコードを出力してはなりません。また、クラス名や関数名を自分で想像して記述することも禁止します。挨拶や補足の解説文も一切不要です。以下のヘッダーに続く表（Table）のデータ行（| テストケース名 | ...）だけを出力してください。");
+        sb.AppendLine();
+        sb.AppendLine("| テストケース名 | 入力値 | 期待される結果 | 判定理由 |");
+        sb.AppendLine("|---|---|---|---|");
+        sb.AppendLine();
+        sb.AppendLine("【対象関数の引数定義】");
+        sb.AppendLine($"引数の情報: {currentMethod.signature}");
 
         onCommunicationComplete = (response) =>
         {
-            string codeText = TrimText(response);
-
-            string folder = Path.GetDirectoryName(savePath);
-            if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
-
-            File.WriteAllText(savePath, codeText, Encoding.UTF8);
-            AssetDatabase.Refresh();
-
-            EditorUtility.DisplayDialog("成功", $"ステップ2完了！\nテストコードを自動生成・保存しました:\n{savePath}", "OK");
+            globalCaseNumber = AppendMethodCasesToTable(finalSpecTable, response, currentMethod, globalCaseNumber);
+            currentMethodIndex++;
+            ProcessNextMethod();
         };
 
         StartSendPrompt(sb.ToString());
     }
-    // =================================================================
-    // 共通サブシステム（Git取得、通信、トリミング）
-    // =================================================================
-    private string GetGitDiff()
+
+    private string GetGitDiffNameOnly()
     {
         try
         {
-            // ★ エディタ拡張自身が差分に入らないよう、指定されたフォルダパスの後ろに
-            // エディタ（Editor）関連ファイルを明示的に除外するGitの仕組みを付与
             string targetPath = string.IsNullOrEmpty(targetDiffPath) ? "Assets" : targetDiffPath;
-
             System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "git",
-                // 指定パスの差分を取りつつ、ツール自身(OllamaTestGeneratorWindowなど)をdiffから完全に遮断する引数
-                Arguments = $"diff -- \"{targetPath}\" \":(exclude)*Editor*\"",
+                Arguments = $"diff --name-only -- \"{targetPath}\" \":(exclude)*Editor*\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -248,6 +217,168 @@ public class OllamaTestGeneratorWindow : EditorWindow
             UnityEngine.Debug.LogError($"Gitエラー: {e.Message}");
             return string.Empty;
         }
+    }
+
+    private List<MethodDefinition> ExtractAllMethodsFromChangedFiles(string nameOnlyDiff)
+    {
+        List<MethodDefinition> methods = new List<MethodDefinition>();
+        string projectRoot = Path.GetDirectoryName(Application.dataPath);
+
+        using (StringReader reader = new StringReader(nameOnlyDiff))
+        {
+            string filePath;
+            while ((filePath = reader.ReadLine()) != null)
+            {
+                filePath = filePath.Trim();
+                if (string.IsNullOrEmpty(filePath) || !filePath.EndsWith(".cs")) continue;
+
+                string fullPath = Path.Combine(projectRoot, filePath);
+                if (!File.Exists(fullPath)) continue;
+
+                string currentClass = Path.GetFileNameWithoutExtension(filePath);
+
+                foreach (string fileLine in File.ReadLines(fullPath, Encoding.UTF8))
+                {
+                    string trimmedLine = fileLine.Trim();
+
+                    if (trimmedLine.Contains("class ") && !trimmedLine.StartsWith("//"))
+                    {
+                        string[] parts = trimmedLine.Split(new[] { "class " }, StringSplitOptions.None);
+                        if (parts.Length > 1)
+                        {
+                            currentClass = parts[1].Split('{', ' ', ':', '\r', '\n')[0].Trim();
+                        }
+                        continue;
+                    }
+
+                    if ((trimmedLine.StartsWith("public ") || trimmedLine.StartsWith("private ") || trimmedLine.StartsWith("protected "))
+                        && trimmedLine.Contains("(") && trimmedLine.Contains(")"))
+                    {
+                        string signature = trimmedLine.Replace(";", "").Trim();
+                        string methodName = "UnknownMethod";
+                        try
+                        {
+                            string[] parts = signature.Split('(');
+                            string[] nameParts = parts[0].Split(' ');
+                            methodName = nameParts[nameParts.Length - 1].Trim();
+                        }
+                        catch { continue; }
+
+                        methods.Add(new MethodDefinition
+                        {
+                            className = currentClass,
+                            methodName = methodName,
+                            signature = signature
+                        });
+                    }
+                }
+            }
+        }
+        return methods;
+    }
+
+    private int AppendMethodCasesToTable(StringBuilder tableBuilder, string lLMResponse, MethodDefinition method, int startCaseNumber)
+    {
+        int caseNumber = startCaseNumber;
+        using (StringReader reader = new StringReader(lLMResponse))
+        {
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                line = line.Trim();
+                if (line.StartsWith("|") && !line.Contains("テストケース名") && !line.Contains("---|"))
+                {
+                    string trimmedLine = line.TrimStart('|').TrimEnd('|');
+                    string[] columns = trimmedLine.Split('|');
+
+                    if (columns.Length >= 4)
+                    {
+                        string caseName = columns[0].Trim();
+                        string inputValue = columns[1].Trim();
+                        string expected = columns[2].Trim();
+                        string reason = columns[3].Trim();
+
+                        tableBuilder.AppendLine($"| {caseNumber} | {method.className} | {method.methodName} | {caseName} | {inputValue} | {expected} | {reason} |");
+                        caseNumber++;
+                    }
+                }
+            }
+        }
+
+        if (caseNumber == startCaseNumber)
+        {
+            tableBuilder.AppendLine($"| {caseNumber} | {method.className} | {method.methodName} | AI出力パースエラー | - | - | {lLMResponse.Replace("\n", " ")} |");
+            caseNumber++;
+        }
+
+        return caseNumber;
+    }
+
+    private void SaveFinalSpec(string finalTableText)
+    {
+        string specPath = savePath.Replace(".cs", "_Spec.txt");
+        string folder = Path.GetDirectoryName(specPath);
+        if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+
+        File.WriteAllText(specPath, finalTableText, Encoding.UTF8);
+        AssetDatabase.Refresh();
+
+        EditorUtility.DisplayDialog("成功", "ステップ1完了！\n仕様書(_Spec.txt)を手動用に自動生成しました。", "OK");
+    }
+
+    private void ExecutePhase2(string specPath)
+    {
+        if (!File.Exists(specPath)) return;
+        string specContent = File.ReadAllText(specPath);
+
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("You are a Unity QA Engineer. Convert the following Japanese test specification table into a valid NUnit test class.");
+        sb.AppendLine();
+        sb.AppendLine("## CRITICAL RULES FOR IMPLEMENTATION:");
+        sb.AppendLine("1. Implement a dedicated [Test] method for EVERY single row defined in the specification table.");
+        sb.AppendLine("2. You MUST use the exact class name from '対象クラス名' and the exact method name from '対象メソッド名' columns specified in the table.");
+        sb.AppendLine("3. STATIC METHOD CHECK: If the target method is a static method, call it via 'ClassName.MethodName(...)'. Do NOT use 'new ClassName().MethodName(...)'.");
+        sb.AppendLine("4. DO NOT WRITE UNCHECKED OVERFLOWS: Never write 'int.MaxValue + 1' or 'int.MinValue - 1' directly in the code as it causes a literal overflow compile error (CS0220).");
+        sb.AppendLine("5. Output ONLY valid C# code. Do NOT write any markdown blocks like ```csharp.");
+        sb.AppendLine("6. Do NOT re-define or implement the source classes to avoid duplicate class errors.");
+        sb.AppendLine("7. Do NOT inherit MonoBehaviour.");
+        sb.AppendLine();
+        sb.AppendLine("## Japanese Test Specification ##");
+        sb.AppendLine(specContent);
+        sb.AppendLine();
+        sb.AppendLine("## C# Code Output (Start from here) ##");
+        sb.Append("using System;\nusing NUnit.Framework;\n\n");
+
+        onCommunicationComplete = (response) =>
+        {
+            string codeText = "using System;\nusing NUnit.Framework;\n\n" + TrimText(response);
+
+            string folder = Path.GetDirectoryName(savePath);
+            if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+
+            File.WriteAllText(savePath, codeText, Encoding.UTF8);
+
+            // アセット更新（勝手にテストを走らせるフラグは撤廃）
+            AssetDatabase.Refresh();
+
+            EditorUtility.DisplayDialog("成功", $"ステップ2完了！\nテストコードを生成しました。Unityのコンパイルが完了したら『3』のボタンから手動実行できます。\n{savePath}", "OK");
+        };
+
+        StartSendPrompt(sb.ToString());
+    }
+
+    // ★ ボタンから手動で呼び出せるテスト実行メソッド
+    private static void RunAllEditModeTests()
+    {
+        var testRunnerApi = ScriptableObject.CreateInstance<UnityEditor.TestTools.TestRunner.Api.TestRunnerApi>();
+        testRunnerApi.RegisterCallbacks(new TestResultCallbacks());
+
+        var filter = new UnityEditor.TestTools.TestRunner.Api.Filter
+        {
+            testMode = UnityEditor.TestTools.TestRunner.Api.TestMode.EditMode
+        };
+
+        testRunnerApi.Execute(new UnityEditor.TestTools.TestRunner.Api.ExecutionSettings(filter));
     }
 
     private void StartSendPrompt(string prompt)
@@ -275,16 +406,17 @@ public class OllamaTestGeneratorWindow : EditorWindow
         {
             UnityEngine.Debug.LogError($"Ollamaエラー: {currentRequest.error}");
             EditorUtility.DisplayDialog("エラー", $"Ollamaとの通信に失敗しました:\n{currentRequest.error}", "OK");
+            EndProcessing();
         }
         else
         {
             string jsonResponse = currentRequest.downloadHandler.text;
             OllamaResponse responseData = JsonUtility.FromJson<OllamaResponse>(jsonResponse);
 
-            onCommunicationComplete?.Invoke(responseData.response);
+            var callback = onCommunicationComplete;
+            EndProcessing();
+            callback?.Invoke(responseData.response);
         }
-
-        EndProcessing();
     }
 
     private void EndProcessing()
@@ -304,6 +436,9 @@ public class OllamaTestGeneratorWindow : EditorWindow
         if (startIndex == -1) startIndex = text.IndexOf("public class");
 
         if (startIndex != -1) text = text.Substring(startIndex);
+
+        if (text.Contains("using System;")) text = text.Replace("using System;", "").Trim();
+        if (text.Contains("using NUnit.Framework;")) text = text.Replace("using NUnit.Framework;", "").Trim();
         return text.Trim();
     }
 
